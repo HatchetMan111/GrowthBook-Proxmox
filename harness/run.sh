@@ -167,6 +167,16 @@ case "$cmd" in
         echo "$id running $hostname" >> "$HS/ct_list"
         echo "running" > "$HS/ct_${id}.status"
         echo "$hostname" > "$HS/ct_${id}.hostname"
+        # spawn_fail (Live-Fund ProxSmartHome CT 210): pct create --start meldet
+        # gescheiterten Spawn NICHT über den Exit-Code – CT existiert, bleibt
+        # aber gestoppt, Exit trotzdem 0 (sync_wait-Fehler nur auf stderr).
+        if [[ -f "$HS/spawn_fail" ]]; then
+            echo "sync_wait: 34 An error occurred in another process (expected sequence number 7)" >&2
+            echo "__lxc_start: 2127 Failed to spawn container \"$id\"" >&2
+            /bin/sed -i "s|^$id .*|$id stopped $hostname|" "$HS/ct_list"
+            echo "stopped" > "$HS/ct_${id}.status"
+            exit 0
+        fi
         exit 0 ;;
     start)
         [[ -f "$HS/ct_${id}.status" ]] || { echo "mock: CT $id unbekannt" >&2; exit 2; }
@@ -247,21 +257,26 @@ set -u
 HS="${HARNESS_STATE:?}"
 echo "pveam $*" >> "$HS/calls.log"
 TMPL="local:vztmpl/debian-13-standard_13.2-1_amd64.tar.zst"
+TMPL_ARM="local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst"
 case "${1:-}" in
     list)
         if [[ -f "$HS/template_downloaded" && ! -f "$HS/pveam_empty" ]]; then
             echo "$TMPL  123456789"
+            # Decoy (Live-Fund ProxSmartHome CT 210): Cache kann BEIDE Archs halten
+            [[ -f "$HS/pveam_both_arch" ]] && echo "$TMPL_ARM  123456789"
         fi
         exit 0 ;;
     available)
         if [[ ! -f "$HS/pveam_empty" ]]; then
             echo "system          $TMPL  123456789"
+            [[ -f "$HS/pveam_both_arch" ]] && echo "system          $TMPL_ARM  123456789"
         fi
         exit 0 ;;
     update)   exit 0 ;;
     download)
         mkdir -p "$HS/templates"
         touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
+        touch "$HS/templates/debian-13-standard_13.6-1_arm64.tar.zst"
         touch "$HS/template_downloaded"
         exit 0 ;;
 esac
@@ -760,6 +775,28 @@ assert_out "Installationsfehler – Exit-Code 255"
 assert_out "Fehlgeschlagener Befehl"
 assert_out "--debug"
 assert_out "Neu ausführen mit vollem bash -x-Trace"
+
+t "Install: arm64-Template im Cache (Decoy) → Arch-Filter wählt amd64"
+reset_state
+touch "$HS/pveam_both_arch"      # pveam list/available liefern amd64 + arm64
+seed_inner_tools
+touch "$HS/template_downloaded"
+touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
+ec=$(run_installer); assert_exit 0 "$ec"
+assert_out "Host-Architektur: amd64"
+assert_out "Template: debian-13-standard_13.2-1_amd64.tar.zst (arch amd64)"
+assert_fcontains "$HS/ct_200.create" "local:vztmpl/debian-13-standard_13.2-1_amd64.tar.zst"
+if /bin/grep -q "arm64" "$HS/ct_200.create"; then fail "arm64-Rootfs angelegt (sollte amd64 sein)"
+else pass "create nur mit amd64-Template"; fi
+
+t "Install: pct create Exit 0 trotz Spawn-Fail → die() mit --force-Hinweis (CT-210-Grube)"
+reset_state
+touch "$HS/spawn_fail"
+ec=$(run_installer); assert_exit 1 "$ec"
+assert_out "Container 200 startet nicht (pct create --start lief trotzdem Exit 0)"
+assert_out "Template-Architektur passt nicht zum Host"
+assert_out "Aufräumen: pct destroy 200 --purge"
+assert_out "--force"
 
 t "Install: DNS tot ohne Fallback-Erfolg → die() mit Diagnose"
 reset_state

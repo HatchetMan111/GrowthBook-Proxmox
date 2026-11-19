@@ -19,7 +19,9 @@ Das Script:
 
 - erstellt einen **unprivilegierten LXC** (Default: 2 vCPU, 4 GB RAM, 12 GB Disk,
   Debian 13 bevorzugt, `nesting=1 keyctl=1`, `onboot=1`, Hostname `growthbook`,
-  nächste freie CT-ID ab 200)
+  nächste freie CT-ID ab 200). Das Template wird **arch-bewusst** gewählt (amd64/arm64
+  passend zum Host) und der Container-Start aktiv verifiziert – `pct create --start`
+  meldet einen gescheiterten Spawn nicht über den Exit-Code.
 - installiert Docker CE und startet die **offiziellen Images** (kein Build im CT):
   `growthbook/growthbook:<pin>` + `mongo:8`
 - generiert `.env` (chmod 600) mit den Pflicht-Secrets: `JWT_SECRET` (bei
@@ -130,8 +132,8 @@ Dateien in `uploads`.
 Umgebung (unshare + Fakebin; pct/pveam/curl/apt/docker/systemctl gemockt, das
 In-Container-Setup läuft echt): Install (inkl.
 Bootstrap-Reihenfolge nacktes Debian → curl → docker), Compose-/Env-/Unit-/Sync-
-Inhalte, Update (Secrets bleiben), Uninstall, Status, alle Fehlerketten: **183
-Assertions in 41 Cases**.
+Inhalte, Update (Secrets bleiben), Uninstall, Status, alle Fehlerketten inkl.
+Arch-Filter und Spawn-Fail-Erkennung: **193 Assertions in 43 Cases**.
 
 ```bash
 bash harness/run.sh    # Exit 0 = alle grün
