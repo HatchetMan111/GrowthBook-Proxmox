@@ -23,7 +23,9 @@ Das Script:
   passend zum Host) und der Container-Start aktiv verifiziert – `pct create --start`
   meldet einen gescheiterten Spawn nicht über den Exit-Code.
 - installiert Docker CE und startet die **offiziellen Images** (kein Build im CT):
-  `growthbook/growthbook:<pin>` + `mongo:8`
+  `growthbook/growthbook:<pin>` + **`mongo:8`** (AVX-CPU) bzw. **`mongo:4.4`**
+  (Fallback ohne AVX – MongoDB 5.0+ stirbt sonst mit „Illegal instruction“,
+  Exit 132; der Pin landet in `.env` und bleibt über `--update` erhalten)
 - generiert `.env` (chmod 600) mit den Pflicht-Secrets: `JWT_SECRET` (bei
   `NODE_ENV=production` Pflicht – ohne wirft GrowthBook beim Boot einen Fehler),
   `ENCRYPTION_KEY` (verschlüsselt SDK-Credentials), `MONGO_PASS` (einmalig generiert,
@@ -60,6 +62,22 @@ Der Installer pinnt daher einen konkreten Commit-Stand (`git-6c38e93` ≈ Releas
 v5.2.1) statt des beweglichen `:latest` – Updates laufen bewusst über
 `--update`, nicht unbemerkt beim Boot. Die Pins werden hier bei Releases aktualisiert.
 
+## ⚠️ MongoDB braucht AVX (Live-Fund ProxSmartHome CT 203)
+
+MongoDB **5.0+** (also `mongo:5/6/7/8`) startet nur mit dem CPU-Flag **AVX** —
+sonst stirbt `mongod` mit `Illegal instruction` (Exit 132) und crash-looped, der
+Healthcheck-Gate blockiert GrowthBook dann für immer. Der Installer prüft die
+Host-CPU **während der Installation**:
+
+| Host-CPU | Mongo-Image | Bedeutung |
+|---|---|---|
+| mit `avx` | `mongo:8` | Default, aktueller Stand |
+| ohne `avx` | `mongo:4.4` | letzte AVX-freie Linie, kompatibel zu GrowthBooks Treiber (mongodb 4.17.2 / mongoose 6) |
+
+Der Pin landet in `/opt/growthbook/.env` (`MONGO_IMAGE=…`) und bleibt über
+`--update` erhalten. Erzwingen geht mit `--mongo-image mongo:8` (nur mit AVX-CPU
+sinnvoll) oder `--mongo-image mongo:4.4`.
+
 ## Update
 
 ```bash
@@ -91,7 +109,7 @@ Exit-Code, Log-Auszüge, Container-Logs) und bleibt zur Inspektion stehen
 │            sync-app-url.sh → APP_ORIGIN/API_HOST = CT-IP)   │
 │                                                             │
 │  docker compose (name: growthbook):                         │
-│   mongo       mongo:8                    intern (KEIN Expose)│
+│   mongo       mongo:8 (AVX) / mongo:4.4  intern (KEIN Expose)│
 │   growthbook  growthbook/growthbook:<pin> 0.0.0.0:<PORT>→3000│
 │                                           0.0.0.0:<STREAM>→3100│
 │                                                             │
@@ -133,7 +151,7 @@ Umgebung (unshare + Fakebin; pct/pveam/curl/apt/docker/systemctl gemockt, das
 In-Container-Setup läuft echt): Install (inkl.
 Bootstrap-Reihenfolge nacktes Debian → curl → docker), Compose-/Env-/Unit-/Sync-
 Inhalte, Update (Secrets bleiben), Uninstall, Status, alle Fehlerketten inkl.
-Arch-Filter und Spawn-Fail-Erkennung: **193 Assertions in 43 Cases**.
+Arch-Filter, Spawn-Fail-Erkennung und AVX-Fallback: **213 Assertions in 48 Cases**.
 
 ```bash
 bash harness/run.sh    # Exit 0 = alle grün

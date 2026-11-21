@@ -455,6 +455,20 @@ esac
 exit 0
 EOF
 
+# cpuinfo-Mock: /proc/cpuinfo des Harness-Users ausgeben; no_avx-Hebel entfernt
+# das avx-Flag (simuliert Intel G4650 / ProxSmartHome CT 203).
+cat > "$MK/mock-cpuinfo" <<'EOF'
+#!/usr/bin/env bash
+set -u
+HS="${HARNESS_STATE:?}"
+if [[ -f "$HS/no_avx" ]]; then
+    printf 'processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 54\nmodel name\t: Intel(R) Pentium(R) CPU G4650 @ 3.06GHz\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2 ssse3 sse4_1 sse4_2\n'
+else
+    printf 'processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nflags\t\t: fpu vme de pse sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n'
+fi
+exit 0
+EOF
+
 cat > "$MK/mock-aptget" <<'EOF'
 #!/usr/bin/env bash
 # apt-Mock: installiert curl real in der Inner-Fakebin (Bootstrap-Reihenfolge)
@@ -480,7 +494,8 @@ chmod +x "$MK"/mock-* "$MK"/bin-host/* "$MK"/bin-inner/* 2>/dev/null
 
 # ── Runner ─────────────────────────────────────────────────────────────────
 reset_state() {
-    rm -rf "$HS"; mkdir -p "$HS" "$HS/templates" "$MK/etc/systemd/system" "$MK/etc/dhcp" \
+    rm -rf "$HS" "$MK/opt/growthbook" "$MK/etc/systemd/system"; mkdir -p "$HS" "$HS/templates" \
+        "$MK/etc/systemd/system" "$MK/etc/dhcp" \
         "$MK/opt" "$MK/root" "$MK/var/log" "$MK/tmp"
     echo "$CT_IP" > "$HS/ct_ip"
     : > "$HS/ct_list"
@@ -490,6 +505,26 @@ reset_state() {
 run_installer() {
     ( unshare -rm env -i PATH="$HOSTBIN:/usr/sbin:/usr/bin:/sbin:/bin" \
         HARNESS_STATE="$HS" HOME=/root TERM=dumb LANG=C.UTF-8 \
+        bash "$SCRIPT" "$@" > "$CUR_DIR/out.log" 2>&1 )
+    echo $?
+}
+# /proc/cpuinfo-Mock (AVX-Fall): der Host-Runner läuft in unshare -rm und sähe
+# sonst die ECHTE CPU des Build-Rechners. Statt eines mount --bind (braucht
+# CAP_SYS_ADMIN, das im User-Namespace fehlt) zeigt der Installer die Quelle
+# /proc/cpuinfo über HOST_CPUINFO – wir schreiben den gewünschten Flags-Inhalt
+# in eine Datei und übergeben den Pfad als Env.
+run_installer_cpu() {
+    local avx_mode="$1"; shift
+    if [[ "$avx_mode" == "no_avx" ]]; then
+        printf 'processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2 ssse3 sse4_1 sse4_2\n' > "$MK/cpuinfo.noavx"
+    else
+        printf 'processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: fpu vme de pse sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n' > "$MK/cpuinfo.avx"
+    fi
+    local src="$MK/cpuinfo.avx"
+    [[ "$avx_mode" == "no_avx" ]] && src="$MK/cpuinfo.noavx"
+    ( unshare -rm env -i PATH="$HOSTBIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+        HARNESS_STATE="$HS" HOME=/root TERM=dumb LANG=C.UTF-8 \
+        HOST_CPUINFO="$src" \
         bash "$SCRIPT" "$@" > "$CUR_DIR/out.log" 2>&1 )
     echo $?
 }
@@ -536,6 +571,7 @@ COMPOSESEED
     cat > "$MK/opt/growthbook/.env" <<ENVSEED
 MONGO_PASS=aaaabbbbccccdddd1111222233334444
 MONGODB_URI=mongodb://root:aaaabbbbccccdddd1111222233334444@mongo:27017/growthbook?authSource=admin
+MONGO_IMAGE=mongo:8
 JWT_SECRET=1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff
 ENCRYPTION_KEY=aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999
 NODE_ENV=production
@@ -639,8 +675,10 @@ assert_out "Deinstall: bash -c"
 t "Compose-Datei: Pin, Härtung, Abhängigkeiten"
 assert_file "$COMPOSE_PATH"
 assert_fcontains "$COMPOSE_PATH" "name: growthbook"
-assert_fcontains "$COMPOSE_PATH" "image: mongo:8"
+assert_fcontains "$COMPOSE_PATH" "image: mongo:"
 assert_fcontains "$COMPOSE_PATH" "image: growthbook/growthbook:${VER}"
+if /bin/grep -q "mongo --quiet --eval" "$COMPOSE_PATH"; then pass "Healthcheck nutzt mongo-Shell (4.4-tauglich)"
+else fail "Healthcheck nutzt mongo-Shell NICHT"; /bin/sed -n '1,20p' "$COMPOSE_PATH" 2>/dev/null | sed 's/^/      /'; fi
 assert_fcontains "$COMPOSE_PATH" 'ports:
       - "3000:3000"'
 assert_fcontains "$COMPOSE_PATH" 'ports:
@@ -653,7 +691,7 @@ assert_fcontains "$COMPOSE_PATH" 'env_file:
 # Mongo-Passwort: Compose-Interpolation aus .env (MUSS literal im File stehen)
 # shellcheck disable=SC2016  # Absicht: Literal – ${MONGO_PASS} darf hier NICHT expandieren
 assert_fcontains "$COMPOSE_PATH" 'MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS}'
-assert_fcontains "$COMPOSE_PATH" 'mongosh --quiet --eval'
+assert_fcontains "$COMPOSE_PATH" 'mongo --quiet --eval'
 assert_fcontains "$COMPOSE_PATH" "mongodata:/data/db"
 assert_fcontains "$COMPOSE_PATH" "uploads:/usr/local/src/app/packages/back-end/uploads"
 
@@ -797,6 +835,41 @@ assert_out "Container 200 startet nicht (pct create --start lief trotzdem Exit 0
 assert_out "Template-Architektur passt nicht zum Host"
 assert_out "Aufräumen: pct destroy 200 --purge"
 assert_out "--force"
+
+t "Install: CPU ohne AVX → mongo:4.4-Fallback + Warnung (CT-203-Grube)"
+reset_state
+ec=$(run_installer_cpu no_avx); assert_exit 0 "$ec"
+assert_out "CPU hat KEIN avx-Flag"
+assert_out "Fallback auf mongo:4.4"
+assert_fcontains "$COMPOSE_PATH" "image: mongo:4.4"
+if /bin/grep -q '^MONGO_IMAGE=mongo:4\.4$' "$ENV_PATH" 2>/dev/null; then pass ".env pinnt MONGO_IMAGE=mongo:4.4"
+else fail ".env pinnt MONGO_IMAGE=mongo:4.4 NICHT"; /bin/grep -n 'MONGO_IMAGE' "$ENV_PATH" 2>/dev/null | sed 's/^/      /'; fi
+assert_out "http://$CT_IP:3000"
+
+t "Install: CPU mit AVX → mongo:8 (Default)"
+reset_state
+ec=$(run_installer_cpu avx); assert_exit 0 "$ec"
+assert_out "CPU-Flags enthalten avx → mongo:8"
+assert_fcontains "$COMPOSE_PATH" "image: mongo:8"
+assert_fcontains "$ENV_PATH" "MONGO_IMAGE=mongo:8"
+
+t "Install: --mongo-image mongo:8 erzwingen (auf AVX-loser CPU) → kein Fallback"
+reset_state
+ec=$(run_installer_cpu no_avx --mongo-image mongo:8); assert_exit 0 "$ec"
+assert_out "Mongo-Image (fest vorgegeben): mongo:8"
+assert_no_out "Fallback auf mongo:4.4"
+assert_fcontains "$COMPOSE_PATH" "image: mongo:8"
+
+t "--mongo-image ungültig (Sonderzeichen) → die()"
+reset_state
+ec=$(run_installer --mongo-image "mongo:8; rm -rf /"); assert_exit 1 "$ec"
+assert_out "Ungültige --mongo-image-Angabe"
+
+t "Compose-Healthcheck: mongo 4.4-tauglich (mongo-Shell statt mongosh)"
+reset_state
+ec=$(run_installer_cpu avx); assert_exit 0 "$ec"
+assert_fcontains "$COMPOSE_PATH" 'mongo --quiet --eval'
+assert_no_fcontains "$COMPOSE_PATH" 'CMD-SHELL", "mongosh'
 
 t "Install: DNS tot ohne Fallback-Erfolg → die() mit Diagnose"
 reset_state

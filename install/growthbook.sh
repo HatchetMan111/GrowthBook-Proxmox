@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.1"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.2"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="growthbook"
 UPSTREAM_OWNER="growthbook"
 UPSTREAM_REPO="growthbook"
@@ -46,9 +46,14 @@ GB_VERSION="git-6c38e93"    # Image-Pin = Docker-Hub-Tag git-<sha> (≈ v5.2.1, 
                             # Docker-Tags, nur latest + git-<sha> – deshalb pinnen
                             # wir den Commit und nicht :latest. --version überschreibt;
                             # --update zieht den hier gepinnten Stand.
-MONGO_IMAGE="mongo:8"       # offizielles Template nutzt mongo:latest – gepinnt auf
-                            # Major 8 (aktuelle stabile MongoDB, von GrowthBook
-                            # unterstützt; mongo:latest = bewegliches Ziel)
+MONGO_IMAGE=""              # leer = automatisch: mongo:8 (AVX) bzw. mongo:4.4 ohne AVX
+                            # (siehe MONGO_IMAGE_DEFAULT/LEGACY unten). --mongo-image
+                            # überschreibt; --update zieht den gesetzten Wert aus .env
+MONGO_IMAGE_DEFAULT="mongo:8"        # MongoDB 5.0+ BRAUCHT AVX (CPU-Flag) – "Illegal
+                            # instruction"/Exit 132 sonst (Live-Fund ProxSmartHome CT 203)
+MONGO_IMAGE_LEGACY="mongo:4.4"       # letzte AVX-freie MongoDB-Linie; passt zu
+                            # GrowthBooks Treiber-Stack (mongodb-Treiber 4.17.2 +
+                            # mongoose 6 – beide offiziell kompatibel mit Server 4.4)
 APP_DIR="/opt/growthbook"   # Projektverzeichnis im Container
 CT_ID=""                    # leer = automatisch nächste freie ID ab ID_SCAN_START
 ID_SCAN_START=200
@@ -268,6 +273,38 @@ ensure_ct_running() {
     die "Container $ct_id hat nach 60 s keine IP (Bridge/Netz prüfen: pct exec $ct_id -- ip a)"
 }
 
+# ── Mongo-Image bestimmen (AVX-Falle) ──────────────────────────────────────
+# MongoDB 5.0+ (also mongo:5/6/7/8) braucht zwingend das CPU-Flag AVX. Fehlt es,
+# startet mongod mit "Illegal instruction" (Exit 132) und crash-looped – der
+# Healthcheck-Gate blockiert dann GrowthBook für immer. Live-Fund ProxSmartHome
+# (Intel G4650, CT 203): genau so gestorben. Deshalb prüfen wir das Flag WÄHREND
+# der Installation und wählen mongo:4.4 (letzte AVX-freie Linie, kompatibel zu
+# GrowthBooks Treiber mongodb 4.17.2/mongoose 6), wenn AVX fehlt.
+# CPUINFO_SRC: normal /proc/cpuinfo; überschreibbar für Tests (HOST_CPUINFO).
+resolve_mongo_image() {
+    local want="${MONGO_IMAGE:-}" host_flags="" src="${HOST_CPUINFO:-/proc/cpuinfo}"
+    # Host-CPU-Flags (robust: /proc/cpuinfo, sonst Fallback auf mongo:8)
+    if [[ -r "$src" ]]; then
+        host_flags=$(grep -m1 '^flags' "$src" 2>/dev/null | cut -d: -f2 || true)
+        [[ -n "$host_flags" ]] || host_flags=$(grep -m1 '^Features' "$src" 2>/dev/null | cut -d: -f2 || true)
+    fi
+    if [[ -n "$want" ]]; then
+        MONGO_IMAGE="$want"
+        ok "Mongo-Image (fest vorgegeben): ${MONGO_IMAGE}"
+        return 0
+    fi
+    if [[ -n "$host_flags" ]] && grep -qw avx <<<"$host_flags"; then
+        MONGO_IMAGE="$MONGO_IMAGE_DEFAULT"
+        ok "CPU-Flags enthalten avx → ${MONGO_IMAGE}"
+    else
+        MONGO_IMAGE="$MONGO_IMAGE_LEGACY"
+        warn "CPU hat KEIN avx-Flag (Quelle: ${src}; Flags: $(echo "$host_flags" | tr -s ' ' | cut -c1-80)…)"
+        warn "→ MongoDB 5.0+ würde mit 'Illegal instruction' abstürzen (Live-Fall G4650)."
+        warn "→ Fallback auf ${MONGO_IMAGE} (letzte AVX-freie Linie, treiberkompatibel)."
+        warn "  Erzwingen mit:  --mongo-image ${MONGO_IMAGE_DEFAULT}  (nur mit AVX-CPU!)"
+    fi
+}
+
 # ── Argumente parsen ───────────────────────────────────────────────────────
 parse_args() {
     # Grube (bash -c): `bash -c "$(wget -qLO - URL)" --id 5` belegt das ERSTE
@@ -294,6 +331,7 @@ parse_args() {
             --sshkey)          CT_SSHKEY="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --port)            UI_PORT="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --stream-port)     STREAM_PORT="${args[$((i+1))]:-}"; i=$((i+2)) ;;
+            --mongo-image)     MONGO_IMAGE="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --version)         GB_VERSION="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --force)           FORCE_RECREATE=true; i=$((i+1)) ;;
             --yes|-y)          ASSUME_YES=true; i=$((i+1)) ;;
@@ -320,6 +358,10 @@ parse_args() {
     if ! [[ "$GB_VERSION" =~ ^[0-9A-Za-z._-]+$ ]]; then
         die "Ungültige Versions-Pin-Angabe: '$GB_VERSION' (erwartet z. B. git-6c38e93)"
     fi
+    # Mongo-Image: nur sichere Zeichen (Repo:Tag) – landet direkt in der Compose-Datei.
+    if [[ -n "$MONGO_IMAGE" ]] && ! [[ "$MONGO_IMAGE" =~ ^[0-9A-Za-z][0-9A-Za-z._/:-]*$ ]]; then
+        die "Ungültige --mongo-image-Angabe: '$MONGO_IMAGE' (erwartet z. B. mongo:8 oder mongo:4.4)"
+    fi
 }
 
 print_help() {
@@ -345,6 +387,9 @@ Optionen (hinter dem schließenden Anführungszeichen anhängen, z. B. ... " --i
   --sshkey PFAD      Public-Key-Datei oder URL – ssh-key-Login als root im CT
   --port PORT        Web-UI-Port (Default: 3000 – Default der offiziellen Compose)
   --stream-port PORT API/SDK-Streaming-Port (Default: 3100 – offizielle Compose)
+  --mongo-image IMG  Mongo-Image erzwingen (Default: automatische AVX-Erkennung:
+                     mongo:8 bei AVX-CPU, mongo:4.4 ohne AVX – sonst "Illegal
+                     instruction"/Exit 132 und Healthcheck-Gate blockiert ewig)
   --version V        Image-Pin überschreiben (Default: git-6c38e93 ≈ v5.2.1;
                      GrowthBook-Docker-Tags sind git-<sha>, kein Semver)
   --force            Vorhandenen Container mit gleichem Hostname löschen und neu anlegen
@@ -449,7 +494,15 @@ services:
     volumes:
       - mongodata:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval \\"db.adminCommand('ping')\\""]
+      # ACHTUNG (Live-Fund ProxSmartHome CT 203): mongo:4.4-Images haben KEIN
+      # mongosh (erst ab 5.0) – der Healthcheck muss deshalb mit dem alten
+      # mongo-Shell arbeiten. `mongo --eval` gibt bei Erfolg 0 zurück, bei
+      # Verbindungsfehlern (auch unauth) != 0.
+      # ACHTUNG 2 (Live-Fund, CT 203): MongoDB 5.0+ braucht zwingend AVX. Ohne
+      # CPU-Flag stirbt mongod mit "Illegal instruction" (Exit 132) und crash-
+      # loopt – der Installer wählt das Image deshalb per AVX-Erkennung (mongo:8
+      # mit AVX, sonst mongo:4.4) und hält es in .env fest.
+      test: ["CMD-SHELL", "mongo --quiet --eval 'db.adminCommand({ping:1}).ok' | grep -q 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -541,6 +594,10 @@ if [[ -z "$(dotenv_get ENCRYPTION_KEY)" ]]; then
 fi
 [[ -n "$(dotenv_get NODE_ENV)" ]]       || dotenv_set NODE_ENV "production"
 [[ -n "$(dotenv_get UPLOAD_METHOD)" ]]  || dotenv_set UPLOAD_METHOD "local"
+# MONGO_IMAGE: Pin mitschreiben, damit --update (und jeder Reboot) denselben
+# Stand behält – sonst würde bei AVX-loser CPU ein Re-Run still auf mongo:8
+# zurückspringen und den Stack wieder killen.
+[[ -n "$(dotenv_get MONGO_IMAGE)" ]]    || dotenv_set MONGO_IMAGE "${MONGO_IMAGE}"
 # Telemetrie: dokumentierte Option – standardmäßig AUS (Privacy-first).
 # Zum Wiedereinschalten in .env auf "false" setzen und den Stack neu starten.
 if [[ -z "$(dotenv_get DISABLE_TELEMETRY)" ]]; then
@@ -786,7 +843,7 @@ print_summary() {
         echo -e "  ${GREEN}  🔑 Root-PW:   ${CT_PASSWORD}${NC}"
     fi
     echo -e "  ${GREEN}  🔧 Installer: v${INSTALLER_VERSION} (upstream ${UPSTREAM_OWNER}/${UPSTREAM_REPO})${NC}"
-    echo -e "  ${GREEN}  📦 Image-Pin: growthbook/growthbook:${GB_VERSION}  +  ${MONGO_IMAGE}${NC}"
+    echo -e "  ${GREEN}  📦 Image-Pin: growthbook/growthbook:${GB_VERSION}  +  ${MONGO_IMAGE:-automatisch (AVX)}${NC}"
     echo -e "  ${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "  ${CYAN}Erste Schritte:${NC}"
@@ -865,6 +922,9 @@ do_install() {
         pveam download local "$template"
     fi
     ok "Template: $template (arch ${host_arch})"
+
+    info "Prüfe CPU-Flags (AVX) für die Mongo-Wahl ..."
+    resolve_mongo_image
 
     # ID & Passwort
     if [[ -z "$CT_ID" ]]; then
@@ -955,6 +1015,20 @@ do_update() {
     ensure_ct_running "$ct_id"
     verify_ct_dns "$ct_id"
 
+    # Mongo-Pin: --mongo-image hat Vorrang; sonst der in .env festgehaltene Wert
+    # (sonst würde ein Update den AVX-Fallback still auf mongo:8 zurücksetzen).
+    if [[ -z "${MONGO_IMAGE:-}" ]]; then
+        MONGO_IMAGE=$(pct exec "$ct_id" -- sed -n 's/^MONGO_IMAGE=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
+        if [[ -n "$MONGO_IMAGE" ]]; then
+            info "Mongo-Image aus .env übernommen: ${MONGO_IMAGE}"
+        fi
+    fi
+    if [[ -z "${MONGO_IMAGE:-}" ]]; then
+        resolve_mongo_image
+    else
+        ok "Mongo-Image (fest vorgegeben): ${MONGO_IMAGE}"
+    fi
+
     run_inner_setup "$ct_id"
     verify_installation "$ct_id"
 
@@ -1033,10 +1107,11 @@ do_status() {
     fi
 
     # Konfiguration (ohne Secrets auszugeben)
-    local app_origin api_host tel pin=""
+    local app_origin api_host tel pin mpin=""
     app_origin=$(pct exec "$ct_id" -- sed -n 's/^APP_ORIGIN=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     api_host=$(pct exec "$ct_id" -- sed -n 's/^API_HOST=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     tel=$(pct exec "$ct_id" -- sed -n 's/^DISABLE_TELEMETRY=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
+    mpin=$(pct exec "$ct_id" -- sed -n 's/^MONGO_IMAGE=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     pin=$(pct exec "$ct_id" -- sed -n 's|^[[:space:]]*image: growthbook/growthbook:|STILL|p' "${APP_DIR}/docker-compose.yaml" 2>/dev/null | head -1 || true)
     if [[ -n "$app_origin" ]]; then
         info "APP_ORIGIN: $app_origin"
@@ -1046,6 +1121,12 @@ do_status() {
     fi
     if [[ -n "$pin" ]]; then
         info "Image:      growthbook/growthbook:${pin#STILL}"
+    fi
+    if [[ -n "$mpin" ]]; then
+        info "Mongo:      ${mpin}"
+        if [[ "$mpin" == *4.4 ]]; then
+            info "            (AVX-freier Fallback – Host-CPU ohne AVX; mongo:8 würde crashen)"
+        fi
     fi
     if [[ "$tel" == "true" ]]; then
         ok "Telemetrie: AUS (DISABLE_TELEMETRY=true)"
